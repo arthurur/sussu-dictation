@@ -7,7 +7,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state = AppState()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    private let recorder = Recorder()
+    private lazy var recorder = Recorder { [state] level in
+        DispatchQueue.main.async { state.push(level: level) }
+    }
     private let transcriber = Transcriber()
     private lazy var settings = SettingsWindow(state: state)
     private var pill: PillPanel?
@@ -16,9 +18,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
         pill = PillPanel(state: state)
-        recorder.onLevel = { [state] level in
-            DispatchQueue.main.async { state.push(level: level) }
-        }
         hotkey = HotkeyMonitor(state: state,
                                onPress: { [weak self] in self?.start() },
                                onRelease: { [weak self] in self?.stop() },
@@ -60,15 +59,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log.info("start ignored, phase is \(String(describing: self.state.phase), privacy: .public)")
             return
         }
-        do {
-            try recorder.start()
-            pill?.place()
-            state.phase = .recording
-        } catch {
-            log.error("recorder failed: \(error.localizedDescription, privacy: .public)")
-            state.problem = "Microphone unavailable: \(error.localizedDescription)"
-        }
+        // Flip to recording before the mic is open: this runs inside the event tap callback, which has
+        // to return fast, and a Bluetooth mic can take a while to start.
+        pill?.place()
+        state.phase = .recording
         render()
+        Task {
+            do {
+                try await recorder.start(deviceUID: state.inputUID)
+            } catch {
+                log.error("recorder failed: \(error.localizedDescription, privacy: .public)")
+                state.problem = "Microphone unavailable: \(error.localizedDescription)"
+                if state.phase == .recording { state.phase = .idle }
+                render()
+            }
+        }
     }
 
     private func stop() {
@@ -83,12 +88,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // Keep listening briefly so the last word isn't clipped when keys come up mid-syllable.
             try? await Task.sleep(for: .milliseconds(150))
-            let audio = recorder.stop()
+            let audio = await recorder.stop()
             // Anything under ~0.3s is an accidental tap.
             let peak = audio.lazy.map(abs).max() ?? 0
             let mic = AVCaptureDevice.authorizationStatus(for: .audio).rawValue
             log.info("captured \(audio.count) samples, peak \(peak), mic auth \(mic)")
             guard audio.count > Recorder.sampleRate * 3 / 10 else { return }
+            guard peak > 0 else {
+                state.problem = "The microphone sent only silence. Pick another one in Settings."
+                return
+            }
             let started = ContinuousClock.now
             let text: String
             do {
@@ -100,16 +109,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log.info("transcribed \(text.count) chars in \(ContinuousClock.now - started, privacy: .public)")
             guard !text.isEmpty else { return }
             state.lastDuration = ContinuousClock.now - started
-            state.lastTranscript = text
+            let formatted = await Formatting.apply(text, detectLists: state.autoLists)
+            state.lastTranscript = formatted
             state.problem = nil
-            Paster.paste(text)
+            Paster.paste(formatted)
         }
     }
 
     /// The hotkey turned out to be part of another shortcut; drop the audio.
     private func cancel() {
         guard state.phase == .recording else { return }
-        _ = recorder.stop()
+        Task { _ = await recorder.stop() }
         state.phase = .idle
         render()
     }

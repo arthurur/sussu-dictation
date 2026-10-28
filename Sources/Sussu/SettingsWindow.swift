@@ -12,6 +12,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         window.title = "Sussu"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
+        // Open on whichever Space the user is looking at. Without this the window shows up on the
+        // Space it was last on, which looks like the menu item doing nothing.
+        window.collectionBehavior.insert(.moveToActiveSpace)
         window.delegate = self
         window.center()
         return window
@@ -23,13 +26,24 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     func show() {
         state.refreshPermissions()
-        NSApp.activate()
+        state.refreshInputDevices()
+        // The user just clicked a menu bar on some display; open there rather than wherever the
+        // window was last left.
+        if !window.isVisible, let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) {
+            let frame = screen.visibleFrame
+            window.setFrameOrigin(NSPoint(x: frame.midX - window.frame.width / 2, y: frame.midY - window.frame.height / 2))
+        }
+        // Order the window first and force it front: macOS may decline the activation request, and
+        // a visible but unfocused window beats no window.
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        NSApp.activate()
     }
 
     // Coming back from System Settings is when permissions change.
     func windowDidBecomeKey(_ notification: Notification) {
         state.refreshPermissions()
+        state.refreshInputDevices()
     }
 
     // A pending hotkey capture pauses dictation everywhere, so it can't outlive the window's focus.
@@ -58,6 +72,16 @@ private struct SettingsView: View {
             }
             Section("Dictation") {
                 LabeledContent("Hold to talk") { HotkeyField(state: state) }
+                Picker("Microphone", selection: inputSelection) {
+                    Text("System default").tag("")
+                    ForEach(state.inputDevices) { Text($0.name).tag($0.id) }
+                }
+                .disabled(state.phase == .recording || state.phase == .transcribing)
+                Toggle(isOn: $state.autoLists) {
+                    Text("Format lists automatically")
+                    Text(ListDetector.isAvailable ? "Uses Apple Intelligence on this Mac" : "Needs Apple Intelligence")
+                }
+                .disabled(!ListDetector.isAvailable)
                 Toggle("Launch at login", isOn: $state.launchAtLogin)
             }
             Section("Permissions") {
@@ -75,6 +99,14 @@ private struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 380)
         .fixedSize()
+    }
+
+    /// A saved microphone that's unplugged falls back to the system default in the picker.
+    private var inputSelection: Binding<String> {
+        Binding(
+            get: { state.inputDevices.contains { $0.id == state.inputUID } ? state.inputUID : "" },
+            set: { state.inputUID = $0 }
+        )
     }
 
     private var lastDurationText: String {
